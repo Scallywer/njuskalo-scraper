@@ -65,9 +65,17 @@ def _ensure_table(conn):
             last_price      REAL,
             first_reported  TEXT,
             last_reported   TEXT,
+            notified_at     TEXT,
             PRIMARY KEY (watch_name, ad_id)
         )
     """)
+    # Migrate older tables that predate notified_at; backfill existing rows as
+    # already-notified so we don't re-spam past deals on the first flush.
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(watch_hits)").fetchall()]
+    if "notified_at" not in cols:
+        conn.execute("ALTER TABLE watch_hits ADD COLUMN notified_at TEXT")
+        conn.execute("UPDATE watch_hits SET notified_at=? WHERE notified_at IS NULL",
+                     (_now(),))
     conn.commit()
 
 
@@ -106,16 +114,19 @@ def evaluate(conn, watch):
                 (watch["name"], ad_id)).fetchone()
             now = _now()
             if prev is None:
+                # notified_at left NULL -> queued for the next flush (8am job)
                 conn.execute(
                     "INSERT INTO watch_hits (watch_name, ad_id, target_label, "
-                    "last_price, first_reported, last_reported) VALUES (?,?,?,?,?,?)",
+                    "last_price, first_reported, last_reported, notified_at) "
+                    "VALUES (?,?,?,?,?,?,NULL)",
                     (watch["name"], ad_id, target["label"], price, now, now))
                 fresh.append({**r, "_reason": "NEW", "_target": target["label"]})
             elif price is not None and price < (prev["last_price"] or 1e9):
                 drop = prev["last_price"] - price
+                # re-queue (notified_at=NULL) so the price drop gets pushed
                 conn.execute(
-                    "UPDATE watch_hits SET last_price=?, last_reported=?, target_label=? "
-                    "WHERE watch_name=? AND ad_id=?",
+                    "UPDATE watch_hits SET last_price=?, last_reported=?, target_label=?, "
+                    "notified_at=NULL WHERE watch_name=? AND ad_id=?",
                     (price, now, target["label"], watch["name"], ad_id))
                 fresh.append({**r, "_reason": f"PRICE DROP -{drop:.0f}E",
                               "_target": target["label"]})
@@ -148,20 +159,54 @@ def render_report(results: dict) -> str:
     return "\n".join(lines)
 
 
-def render_telegram(results: dict) -> str:
-    """Concise push message — only the fresh deals, with links."""
-    lines = ["🔔 Njuskalo deals"]
-    for name, hits in results.items():
-        if not hits:
-            continue
-        lines.append(f"\n— {name} —")
-        for h in sorted(hits, key=lambda x: x["price_amount"] or 9e9):
-            price = f"{h['price_amount']:.0f}{h['price_currency']}"
-            lines.append(f"{price} · {h['_reason']} · {h['title'][:50]}\n{h['url']}")
-    return "\n".join(lines)
+def flush_pending(conn) -> int:
+    """Send any deals queued (notified_at IS NULL) but still active to Telegram,
+    then mark them notified. This is the 8am job — kept separate from the crawl
+    so notifications never fire in the middle of the night.
+    """
+    from . import notify as notifier
+    _ensure_table(conn)
+    rows = conn.execute("""
+        SELECT wh.watch_name, wh.ad_id, wh.target_label,
+               l.title, l.url, l.price_amount, l.price_currency
+        FROM watch_hits wh JOIN listings l ON l.ad_id = wh.ad_id
+        WHERE wh.notified_at IS NULL AND l.is_active = 1
+        ORDER BY wh.watch_name, l.price_amount
+    """).fetchall()
+    if not rows:
+        print("[flush] nothing pending")
+        return 0
+    lines, cur = ["🔔 Njuskalo deals"], None
+    for r in rows:
+        if r["watch_name"] != cur:
+            cur = r["watch_name"]
+            note = next((w["note"] for w in WATCHES if w["name"] == cur), cur)
+            lines.append(f"\n— {note} —")
+        price = f"{r['price_amount']:.0f}{r['price_currency']}" if r["price_amount"] else "n/a"
+        lines.append(f"{price} · {r['target_label']} · {r['title'][:50]}\n{r['url']}")
+    if not notifier.send("\n".join(lines)):
+        print("[flush] send failed — leaving deals queued for next flush")
+        return 0
+    now = _now()
+    conn.executemany(
+        "UPDATE watch_hits SET notified_at=? WHERE watch_name=? AND ad_id=?",
+        [(now, r["watch_name"], r["ad_id"]) for r in rows])
+    conn.commit()
+    print(f"[flush] pushed {len(rows)} deals to Telegram")
+    return len(rows)
 
 
-async def run(do_crawl=True, max_pages=8, notify=True):
+def flush():
+    conn = db.get_conn()
+    db.init_db(conn)
+    n = flush_pending(conn)
+    conn.close()
+    return n
+
+
+async def run(do_crawl=True, max_pages=8):
+    """Crawl watched categories + evaluate. Queues fresh deals (does NOT send;
+    the separate flush job delivers them at a civilised hour)."""
     conn = db.get_conn()
     db.init_db(conn)
     if do_crawl:
@@ -173,12 +218,8 @@ async def run(do_crawl=True, max_pages=8, notify=True):
         f.write(report + "\n")
     conn.close()
     print(report)
-    print(f"\n[report written to {REPORT_PATH}]")
-
     fresh = sum(len(v) for v in results.values())
-    if notify and fresh:
-        from . import notify as notifier
-        notifier.send(render_telegram(results))
+    print(f"\n[report written to {REPORT_PATH}] — {fresh} deal(s) queued for next flush")
     return results
 
 
@@ -187,9 +228,14 @@ def main():
     ap = argparse.ArgumentParser(description="Evaluate njuskalo watchlist for deals")
     ap.add_argument("--no-crawl", action="store_true",
                     help="don't crawl first (use when a full crawl just ran)")
+    ap.add_argument("--flush", action="store_true",
+                    help="send queued deals to Telegram and exit (the 8am job)")
     ap.add_argument("--max-pages", type=int, default=8)
     args = ap.parse_args()
-    asyncio.run(run(do_crawl=not args.no_crawl, max_pages=args.max_pages))
+    if args.flush:
+        flush()
+    else:
+        asyncio.run(run(do_crawl=not args.no_crawl, max_pages=args.max_pages))
 
 
 if __name__ == "__main__":
