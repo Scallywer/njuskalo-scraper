@@ -24,6 +24,7 @@ FAMILIES = {
     "dronovi":               "Dronovi (drones)",
     "playstation":           "PlayStation (consoles & games)",
     "xbox":                  "Xbox (consoles & games)",
+    "nintendo":              "Nintendo (consoles & games)",
 }
 
 

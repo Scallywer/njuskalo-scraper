@@ -42,16 +42,18 @@ async def crawl_category(fetcher, conn, cat) -> dict:
     slug, base_url, family = cat["slug"], cat["url"], cat["family"]
     seen, inserted, updated = set(), 0, 0
     empty_streak = 0
+    completed = False  # True only if we reached the natural end (ran out of new ads)
 
     for page in range(1, PAGE_CAP + 1):
         html = await fetcher.get(_page_url(base_url, page), allow_free=True)
         if not html:
-            break
+            break  # fetch failure -> incomplete, don't retire listings
         ads = parse_index_page(html, category_slug=slug, family=family)
         new_ids = [a["ad_id"] for a in ads if a["ad_id"] not in seen]
         if not new_ids:
             empty_streak += 1
             if empty_streak > EMPTY_TOLERANCE:
+                completed = True  # reached the end cleanly
                 break
             continue
         empty_streak = 0
@@ -64,10 +66,14 @@ async def crawl_category(fetcher, conn, cat) -> dict:
             updated += result == "updated"
         conn.commit()
 
-    deactivated = db.mark_inactive(conn, slug, seen)
+    # Only retire unseen listings when the crawl actually finished the category.
+    # A truncated crawl (hit PAGE_CAP or a fetch error) must NOT mark the pages
+    # it never reached as sold.
+    deactivated = db.mark_inactive(conn, slug, seen) if completed else 0
     conn.commit()
     return {"slug": slug, "found": len(seen), "inserted": inserted,
-            "updated": updated, "deactivated": deactivated}
+            "updated": updated, "deactivated": deactivated,
+            "completed": completed}
 
 
 async def crawl_index(family=None, category=None, max_pages=None,
@@ -87,6 +93,17 @@ async def crawl_index(family=None, category=None, max_pages=None,
     elif family:
         q += " AND family = ?"; params.append(family)
     cats = [dict(r) for r in conn.execute(q, params).fetchall()]
+
+    # Fallback: an explicit --category not yet in the table -> synthesize it from
+    # the slug so on-demand crawls work without a prior crawl_categories run.
+    if category and not cats:
+        from .parsers import BASE_URL
+        url = f"{BASE_URL}/{category}"
+        db.upsert_category(conn, slug=category, url=url, is_leaf=1,
+                           last_crawled_at=db.utcnow())
+        conn.commit()
+        cats = [{"slug": category, "url": url, "family": None}]
+
     random.shuffle(cats)  # randomize order (anti-pattern-detection)
     if limit_categories:
         cats = cats[:limit_categories]
@@ -106,7 +123,7 @@ async def crawl_index(family=None, category=None, max_pages=None,
                 totals[k] += st[k]
             print(f"  [{i}/{len(cats)}] {st['slug']:28} "
                   f"found={st['found']:4} +{st['inserted']} ~{st['updated']} "
-                  f"-{st['deactivated']}")
+                  f"-{st['deactivated']}{'' if st['completed'] else ' (capped — not retired)'}")
 
     print(f"\nDone. found={totals['found']} inserted={totals['inserted']} "
           f"updated={totals['updated']} deactivated={totals['deactivated']}")

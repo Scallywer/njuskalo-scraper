@@ -22,7 +22,11 @@ source venv/bin/activate
 STAMP="$(date '+%Y-%m-%d %H:%M:%S')"
 echo "===== nightly run $STAMP =====" >> data/nightly.log
 
-# watch.py crawls its own watched categories, then evaluates + writes the report.
-python -m electronics.watch --max-pages 10 >> data/nightly.log 2>&1
+# watch.py crawls the watched categories (newest-first), evaluates, queues
+# deals. Capped at 12 pages: njuskalo sorts newest-first, so newly-posted deals
+# are always on the early pages -- a full scan (apple-iphone alone is ~130 pages
+# / 12 min) is unnecessary nightly. The "retire only on a complete crawl" rule
+# means this cap never wrongly marks deeper listings as sold.
+python -m electronics.watch --max-pages 12 >> data/nightly.log 2>&1
 
 echo "[done $STAMP] report -> data/watch_report.md" >> data/nightly.log

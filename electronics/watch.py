@@ -13,10 +13,44 @@ Add/adjust what you're hunting in WATCHES below.
 """
 
 import os
+import re
 import argparse
 from datetime import datetime, timezone
 
 from . import db, service
+
+# --- Nintendo Switch console matcher ---------------------------------------
+# The /nintendo-switch category is heavily mixed with games (arbitrary names)
+# and accessories. Keyword-exclude leaks games, so instead we accept a title
+# only if it reduces entirely to console-related tokens (model/colour/condition
+# /selling words) AND contains no accessory noun. This cleanly isolates real
+# consoles from "Donkey Kong ... Nintendo Switch", chargers, cases, etc.
+_CONSOLE_OK = {
+    "nintendo", "switch", "v1", "v2", "oled", "konzola", "konzole", "console",
+    "model", "hac", "rabljeno", "rabljen", "rabljena", "nov", "novo", "nova",
+    "novi", "kao", "očuvan", "ocuvan", "ocuvana", "odlicno", "odlično",
+    "odlicnom", "odličnom", "stanje", "stanju", "full", "komplet", "kompletno",
+    "crveni", "crvena", "plavi", "plava", "neon", "sivi", "siva", "sive",
+    "crni", "crna", "crno", "bijeli", "bijela", "bijelo", "grey", "gray",
+    "red", "blue", "prodajem", "prodaja", "hitno", "povoljno", "akcija",
+    "garancija", "racun", "račun", "r1", "fiksno", "fixno", "fix", "fiksna",
+    "cijena", "eur", "gb", "malo", "koristeno", "korišteno", "koristen",
+    "original", "originalno", "s", "sa", "i", "te", "u",
+    "joycon", "joy", "con", "joypad", "kontroleri", "kontrolerima", "kontroler",
+}
+_ACC_NOUNS = ["punjač", "punjac", "dock", "torbic", "maska", "masku", "etui",
+              "kabel", "stalak", "servis", "wheel", "volan", "stanica", "chip",
+              "picofly", "amiibo", "grip", "futrola", "case", "naljepn"]
+
+
+def is_switch_console(title: str) -> bool:
+    tl = (title or "").lower()
+    if "lite" in tl or "switch 2" in tl or "switch2" in tl:
+        return False
+    if any(x in tl for x in _ACC_NOUNS):
+        return False
+    toks = [w for w in re.split(r"[\s/,.\-()!+*:;\"']+", tl) if w and not w.isdigit()]
+    return bool(toks) and all(w in _CONSOLE_OK for w in toks)
 
 REPORT_PATH = os.path.join(db.REPO_ROOT, "data", "watch_report.md")
 
@@ -30,10 +64,19 @@ WATCHES = [
         "crawl": ["apple-iphone"],
         "exclude": ["face id", "faceid", "za dijelove", "dijelove", "ne radi",
                     "neispravan", "oštećen", "ostecen", "slomljen", "puknut",
-                    "pro max", "mini"],
+                    "pro max", "mini",
+                    # accessories that otherwise match "iphone 1x":
+                    "maska", "maskica", "case", "staklo", "staklena", "torbic",
+                    "torba", "kabel", "kabal", "punjač", "punjac", "držač",
+                    "drzac", "naljepnic", "okvir", "futrola", "zaštita", "zastita",
+                    "adapter", "stalak", "samo kutija", "ovitak", "navlaka",
+                    "folija", "zamjena za"],
+        # min_price floors exclude cheap accessories that slip the keyword net.
         "targets": [
-            {"label": "iPhone 14 deal", "any": ["iphone 14"], "max_price": 230},
-            {"label": "iPhone 13 deal", "any": ["iphone 13"], "max_price": 190},
+            {"label": "iPhone 14 deal", "any": ["iphone 14"],
+             "min_price": 120, "max_price": 230},
+            {"label": "iPhone 13 deal", "any": ["iphone 13"],
+             "min_price": 80, "max_price": 190},
         ],
     },
     {
@@ -45,8 +88,20 @@ WATCHES = [
                     "kabel", "kabal", "stalak", "stand", "kamera", "igra ", "igre",
                     " fc ", "fifa"],
         "targets": [
-            {"label": "Series S bargain", "any": ["series s"], "max_price": 170},
-            {"label": "Series X deal", "any": ["series x"], "max_price": 350},
+            {"label": "Series S bargain", "any": ["series s"],
+             "min_price": 100, "max_price": 170},
+            {"label": "Series X deal", "any": ["series x"],
+             "min_price": 200, "max_price": 350},
+        ],
+    },
+    {
+        "name": "switch",
+        "note": "Budget Nintendo Switch console (non-Lite, dockable) under €100",
+        "crawl": ["nintendo-switch"],
+        "exclude": [],  # games/accessories handled by the predicate below
+        "targets": [
+            {"label": "Switch <100", "any": ["switch"],
+             "min_price": 50, "max_price": 99, "predicate": is_switch_console},
         ],
     },
 ]
@@ -87,7 +142,9 @@ def _matches(conn, watch, target):
     """
     out, seen = [], set()
     for slug in watch["crawl"]:
-        rows = service.search(conn, category=slug, max_price=target["max_price"],
+        rows = service.search(conn, category=slug,
+                              min_price=target.get("min_price"),
+                              max_price=target["max_price"],
                               limit=500, sort="price")
         for r in rows:
             t = (r["title"] or "").lower()
@@ -96,6 +153,9 @@ def _matches(conn, watch, target):
             if not any(k in t for k in target["any"]):
                 continue
             if any(x in t for x in watch["exclude"]):
+                continue
+            pred = target.get("predicate")
+            if pred and not pred(r["title"] or ""):
                 continue
             seen.add(r["ad_id"])
             out.append(r)
@@ -134,7 +194,10 @@ def evaluate(conn, watch):
     return fresh
 
 
-async def crawl_watch_categories(watch, max_pages=8):
+async def crawl_watch_categories(watch, max_pages=None):
+    # max_pages=None -> crawl each category to its natural end (no artificial cap;
+    # crawl_index keeps a high safety backstop). njuskalo lists newest-first and
+    # isn't price-sorted, so a deal can be on any page -> full coverage matters.
     from .crawl_index import crawl_index
     for slug in watch["crawl"]:
         await crawl_index(category=slug, max_pages=max_pages, direct_only=True)
@@ -204,7 +267,7 @@ def flush():
     return n
 
 
-async def run(do_crawl=True, max_pages=8):
+async def run(do_crawl=True, max_pages=None):
     """Crawl watched categories + evaluate. Queues fresh deals (does NOT send;
     the separate flush job delivers them at a civilised hour)."""
     conn = db.get_conn()
@@ -230,7 +293,8 @@ def main():
                     help="don't crawl first (use when a full crawl just ran)")
     ap.add_argument("--flush", action="store_true",
                     help="send queued deals to Telegram and exit (the 8am job)")
-    ap.add_argument("--max-pages", type=int, default=8)
+    ap.add_argument("--max-pages", type=int, default=None,
+                    help="cap pages per category (default: none — crawl to the end)")
     args = ap.parse_args()
     if args.flush:
         flush()
