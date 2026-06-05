@@ -62,36 +62,36 @@ WATCHES = [
         "name": "wife-iphone",
         "note": "Budget iPhone upgrade for wife (coming from a Samsung A54)",
         "crawl": ["apple-iphone"],
-        "exclude": ["face id", "faceid", "za dijelove", "dijelove", "ne radi",
-                    "neispravan", "oštećen", "ostecen", "slomljen", "puknut",
-                    "pro max", "mini",
-                    # accessories that otherwise match "iphone 1x":
-                    "maska", "maskica", "case", "staklo", "staklena", "torbic",
-                    "torba", "kabel", "kabal", "punjač", "punjac", "držač",
-                    "drzac", "naljepnic", "okvir", "futrola", "zaštita", "zastita",
-                    "adapter", "stalak", "samo kutija", "ovitak", "navlaka",
-                    "folija", "zamjena za"],
-        # min_price floors exclude cheap accessories that slip the keyword net.
+        # Exclude by CONDITION (broken/parts) and by accessory STRUCTURE
+        # ("za iphone" = an item *for* an iPhone), NOT by accessory nouns —
+        # real phone titles say "iPhone 13, nova baterija, maskica i staklo",
+        # so excluding maska/staklo/baterija would drop genuine deals.
+        "exclude": ["face id", "faceid", "dijelove", "dijelovi", "djelove",
+                    "djelovi", "ne radi", "neispravan", "oštećen", "ostecen",
+                    "slomljen", "puknut", "pro max", "mini", "za iphone",
+                    "za apple", "lcd", "display", "naljepnic", "folija"],
+        # min_price is an accessory-killer floor only — set BELOW the cheapest
+        # plausible real-phone steal, so genuine bargains still come through.
         "targets": [
             {"label": "iPhone 14 deal", "any": ["iphone 14"],
-             "min_price": 120, "max_price": 230},
+             "min_price": 50, "max_price": 230},
             {"label": "iPhone 13 deal", "any": ["iphone 13"],
-             "min_price": 80, "max_price": 190},
+             "min_price": 50, "max_price": 190},
         ],
     },
     {
         "name": "gta-xbox",
         "note": "Cheapest Xbox for GTA VI at launch (friends are on Xbox)",
         "crawl": ["xbox-series-s", "xbox-series-x"],
-        "exclude": ["xbox one", "za dijelove", "dijelove", "ne radi", "neispravan",
-                    "kontroler", "controller", "ssd", "wd black", "samo kutija",
-                    "kabel", "kabal", "stalak", "stand", "kamera", "igra ", "igre",
-                    " fc ", "fifa"],
+        "exclude": ["xbox one", "dijelove", "dijelovi", "djelove", "djelovi",
+                    "ne radi", "neispravan", "kontroler", "controller", "ssd",
+                    "wd black", "samo kutija", "kabel", "kabal", "stalak",
+                    "stand", "kamera", "igra ", "igre", " fc ", "fifa"],
         "targets": [
             {"label": "Series S bargain", "any": ["series s"],
-             "min_price": 100, "max_price": 170},
+             "min_price": 60, "max_price": 170},
             {"label": "Series X deal", "any": ["series x"],
-             "min_price": 200, "max_price": 350},
+             "min_price": 120, "max_price": 350},
         ],
     },
     {
@@ -101,7 +101,7 @@ WATCHES = [
         "exclude": [],  # games/accessories handled by the predicate below
         "targets": [
             {"label": "Switch <100", "any": ["switch"],
-             "min_price": 50, "max_price": 99, "predicate": is_switch_console},
+             "min_price": 40, "max_price": 99, "predicate": is_switch_console},
         ],
     },
 ]
@@ -222,41 +222,49 @@ def render_report(results: dict) -> str:
     return "\n".join(lines)
 
 
+MAX_PER_MESSAGE = 10  # at most this many deals per watch, per push
+
+
 def flush_pending(conn) -> int:
-    """Send any deals queued (notified_at IS NULL) but still active to Telegram,
-    then mark them notified. This is the 8am job — kept separate from the crawl
-    so notifications never fire in the middle of the night.
+    """Send queued deals (notified_at IS NULL, still active) to Telegram.
+
+    One SEPARATE message PER watch, at most MAX_PER_MESSAGE (10) deals each
+    (cheapest first). A watch with nothing pending sends nothing. Only the
+    deals actually sent get marked notified — any overflow beyond 10 stays
+    queued for the next flush. The 8am job; kept apart from the crawl so
+    alerts never fire overnight.
     """
     from . import notify as notifier
     _ensure_table(conn)
-    rows = conn.execute("""
-        SELECT wh.watch_name, wh.ad_id, wh.target_label,
-               l.title, l.url, l.price_amount, l.price_currency
-        FROM watch_hits wh JOIN listings l ON l.ad_id = wh.ad_id
-        WHERE wh.notified_at IS NULL AND l.is_active = 1
-        ORDER BY wh.watch_name, l.price_amount
-    """).fetchall()
-    if not rows:
+    total = 0
+    for w in WATCHES:
+        rows = conn.execute("""
+            SELECT wh.ad_id, wh.target_label, l.title, l.url,
+                   l.price_amount, l.price_currency
+            FROM watch_hits wh JOIN listings l ON l.ad_id = wh.ad_id
+            WHERE wh.notified_at IS NULL AND l.is_active = 1 AND wh.watch_name = ?
+            ORDER BY l.price_amount
+            LIMIT ?
+        """, (w["name"], MAX_PER_MESSAGE)).fetchall()
+        if not rows:
+            continue  # nothing new for this search -> send nothing
+        lines = [f"🔔 {w['note']}"]
+        for r in rows:
+            price = f"{r['price_amount']:.0f}{r['price_currency']}" if r["price_amount"] else "n/a"
+            lines.append(f"{price} · {r['target_label']} · {r['title'][:55]}\n{r['url']}")
+        if not notifier.send("\n".join(lines)):
+            print(f"[flush] {w['name']}: send failed — left queued")
+            continue
+        now = _now()
+        conn.executemany(
+            "UPDATE watch_hits SET notified_at=? WHERE watch_name=? AND ad_id=?",
+            [(now, w["name"], r["ad_id"]) for r in rows])
+        conn.commit()
+        total += len(rows)
+        print(f"[flush] {w['name']}: sent {len(rows)}")
+    if total == 0:
         print("[flush] nothing pending")
-        return 0
-    lines, cur = ["🔔 Njuskalo deals"], None
-    for r in rows:
-        if r["watch_name"] != cur:
-            cur = r["watch_name"]
-            note = next((w["note"] for w in WATCHES if w["name"] == cur), cur)
-            lines.append(f"\n— {note} —")
-        price = f"{r['price_amount']:.0f}{r['price_currency']}" if r["price_amount"] else "n/a"
-        lines.append(f"{price} · {r['target_label']} · {r['title'][:50]}\n{r['url']}")
-    if not notifier.send("\n".join(lines)):
-        print("[flush] send failed — leaving deals queued for next flush")
-        return 0
-    now = _now()
-    conn.executemany(
-        "UPDATE watch_hits SET notified_at=? WHERE watch_name=? AND ad_id=?",
-        [(now, r["watch_name"], r["ad_id"]) for r in rows])
-    conn.commit()
-    print(f"[flush] pushed {len(rows)} deals to Telegram")
-    return len(rows)
+    return total
 
 
 def flush():
