@@ -78,6 +78,10 @@ WATCHES = [
             {"label": "iPhone 13 deal", "any": ["iphone 13"],
              "min_price": 50, "max_price": 190},
         ],
+        # FB Marketplace (Osijek) queries -> stored under these njuskalo slugs
+        # so the same targets above match FB + njuskalo rows together.
+        "fb": [("iphone 13", "apple-iphone", "mobiteli"),
+               ("iphone 14", "apple-iphone", "mobiteli")],
     },
     {
         "name": "gta-xbox",
@@ -93,6 +97,8 @@ WATCHES = [
             {"label": "Series X deal", "any": ["series x"],
              "min_price": 120, "max_price": 350},
         ],
+        "fb": [("xbox series s", "xbox-series-s", "xbox"),
+               ("xbox series x", "xbox-series-x", "xbox")],
     },
     {
         "name": "switch",
@@ -103,6 +109,7 @@ WATCHES = [
             {"label": "Switch <100", "any": ["switch"],
              "min_price": 40, "max_price": 99, "predicate": is_switch_console},
         ],
+        "fb": [("nintendo switch", "nintendo-switch", "nintendo")],
     },
 ]
 
@@ -240,7 +247,7 @@ def flush_pending(conn) -> int:
     for w in WATCHES:
         rows = conn.execute("""
             SELECT wh.ad_id, wh.target_label, l.title, l.url,
-                   l.price_amount, l.price_currency
+                   l.price_amount, l.price_currency, l.source, l.city
             FROM watch_hits wh JOIN listings l ON l.ad_id = wh.ad_id
             WHERE wh.notified_at IS NULL AND l.is_active = 1 AND wh.watch_name = ?
             ORDER BY l.price_amount
@@ -251,7 +258,9 @@ def flush_pending(conn) -> int:
         lines = [f"🔔 {w['note']}"]
         for r in rows:
             price = f"{r['price_amount']:.0f}{r['price_currency']}" if r["price_amount"] else "n/a"
-            lines.append(f"{price} · {r['target_label']} · {r['title'][:55]}\n{r['url']}")
+            src = "FB" if r["source"] == "facebook" else "NJ"
+            where = f" · {r['city']}" if r["city"] else ""
+            lines.append(f"[{src}] {price} · {r['target_label']}{where} · {r['title'][:50]}\n{r['url']}")
         if not notifier.send("\n".join(lines)):
             print(f"[flush] {w['name']}: send failed — left queued")
             continue
@@ -283,6 +292,16 @@ async def run(do_crawl=True, max_pages=None):
     if do_crawl:
         for w in WATCHES:
             await crawl_watch_categories(w, max_pages=max_pages)
+        # Facebook Marketplace (Osijek, anonymous) for watches that define fb
+        # queries. Wrapped so an FB failure (block/layout change) never breaks
+        # the njuskalo watch.
+        try:
+            from .fb_crawl import crawl_fb
+            for w in WATCHES:
+                if w.get("fb"):
+                    await crawl_fb(w["fb"], conn=conn)
+        except Exception as e:
+            print(f"[watch] FB crawl skipped: {type(e).__name__}: {e}")
     results = {w["name"]: evaluate(conn, w) for w in WATCHES}
     report = render_report(results)
     with open(REPORT_PATH, "w", encoding="utf-8") as f:

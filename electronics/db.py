@@ -41,7 +41,8 @@ CREATE TABLE IF NOT EXISTS categories (
 );
 
 CREATE TABLE IF NOT EXISTS listings (
-    ad_id          TEXT PRIMARY KEY,   -- njuskalo ad id (= JSON-LD sku)
+    ad_id          TEXT PRIMARY KEY,   -- njuskalo ad id, or "fb<id>" for FB
+    source         TEXT DEFAULT 'njuskalo',  -- 'njuskalo' | 'facebook'
     title          TEXT,
     price_amount   REAL,
     price_currency TEXT,
@@ -84,7 +85,7 @@ CREATE INDEX IF NOT EXISTS idx_pricehist_ad       ON price_history(ad_id);
 
 # Columns that may be supplied in a listing dict and written verbatim.
 _LISTING_COLUMNS = (
-    "ad_id", "title", "price_amount", "price_currency", "condition",
+    "ad_id", "source", "title", "price_amount", "price_currency", "condition",
     "location", "county", "city", "category_slug", "family", "url",
     "seller_name", "seller_type", "description", "image_url",
     "attributes", "phones",
@@ -110,6 +111,11 @@ def get_conn(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
 def init_db(conn: sqlite3.Connection) -> None:
     """Create tables and indexes if they don't already exist."""
     conn.executescript(SCHEMA)
+    # Migrate older DBs that predate the source column.
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(listings)").fetchall()]
+    if "source" not in cols:
+        conn.execute("ALTER TABLE listings ADD COLUMN source TEXT DEFAULT 'njuskalo'")
+        conn.execute("UPDATE listings SET source='njuskalo' WHERE source IS NULL")
     conn.commit()
 
 
@@ -121,6 +127,8 @@ def _normalize(listing: dict) -> dict:
         if col in ("attributes", "phones") and val is not None and not isinstance(val, str):
             val = json.dumps(val, ensure_ascii=False)
         row[col] = val
+    if row.get("source") is None:
+        row["source"] = "njuskalo"
     return row
 
 
