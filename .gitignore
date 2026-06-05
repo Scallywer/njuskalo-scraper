@@ -36,3 +36,6 @@ Thumbs.db
 venv/
 env/
 .virtualenv/
+
+# Local generated data (SQLite DB + WAL/SHM, logs, reports, proxy cache)
+data/
